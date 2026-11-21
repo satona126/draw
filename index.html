@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>お絵かきで生き物に変換</title>
+  <!-- MediaPipe Hands & Camera Utils -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      user-select: none;
+    }
+    body {
+      background-color: #111;
+      overflow: hidden;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    }
+    #container {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+    }
+    video {
+      display: none;
+    }
+    canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    /* 右上のプラスボタン */
+    #add-me-btn {
+      position: fixed;
+      top: 24px;
+      right: 24px;
+      width: 64px;
+      height: 64px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #ff6b6b, #ff8e53);
+      color: white;
+      font-size: 38px;
+      font-weight: bold;
+      border: 3px solid rgba(255, 255, 255, 0.8);
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+      cursor: pointer;
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 0.15s ease, box-shadow 0.15s ease;
+    }
+    #add-me-btn:hover {
+      transform: scale(1.08);
+      box-shadow: 0 8px 25px rgba(255, 107, 107, 0.6);
+    }
+    #add-me-btn:active {
+      transform: scale(0.95);
+    }
+    /* ステータスガイド表示 */
+    #hud {
+      position: fixed;
+      top: 24px;
+      left: 24px;
+      background: rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(6px);
+      color: #fff;
+      padding: 14px 20px;
+      border-radius: 14px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      z-index: 100;
+      pointer-events: none;
+      line-height: 1.6;
+      font-size: 14px;
+    }
+    #hud strong {
+      font-size: 16px;
+      color: #ffd166;
+    }
+    #loading {
+      position: fixed;
+      inset: 0;
+      background: #111;
+      color: white;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 200;
+      font-size: 20px;
+      gap: 12px;
+    }
+  </style>
+</head>
+<body>
+
+<div id="loading">
+  <div>カメラとAIモデルを起動中...</div>
+  <div style="font-size: 14px; color: #aaa;">カメラの使用を許可してください</div>
+</div>
+
+<div id="container">
+  <video id="video" playsinline></video>
+  <canvas id="canvas"></canvas>
+  <div id="hud">
+    <div>状態: <strong id="gesture-status">手をかざしてください</strong></div>
+    <div>☝️ <b>人差し指だけ立てる</b>：白い線で絵を描く</div>
+    <div>✋ <b>手をパーにする</b>：描いた絵が生き物になる</div>
+    <div>🤏 <b>親指と人差し指でつまむ</b>：生き物を掴んで動かす</div>
+    <div>➕ <b>右上の＋ボタン</b>：自分の姿を生き物にする</div>
+  </div>
+  <button id="add-me-btn" title="自分の画像を生き物にする">＋</button>
+</div>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('gesture-status');
+const addMeBtn = document.getElementById('add-me-btn');
+const loadingEl = document.getElementById('loading');
+
+let width = canvas.width = window.innerWidth;
+let height = canvas.height = window.innerHeight;
+
+window.addEventListener('resize', () => {
+  width = canvas.width = window.innerWidth;
+  height = canvas.height = window.innerHeight;
+});
+
+// 描画中のストロークと全ストローク
+let allStrokes = [];
+let currentStroke = null;
+
+// 生まれた生き物のリスト
+let creatures = [];
+
+// 掴み状態管理
+let grabbedCreature = null;
+let grabOffset = { x: 0, y: 0 };
+let lastPinchPos = { x: 0, y: 0 };
+
+// 最新の手のランドマーク情報
+let latestHandData = null;
+
+// 2点間の距離
+function dist(p1, p2) {
+  return Math.hypot(p1.x - p2.x, p1.y - p2.y);
+}
+
+// 指が伸びているか判定（手首からの距離を比較）
+function isFingerExtended(lm, tipIdx, pipIdx) {
+  const wrist = lm[0];
+  return dist(lm[tipIdx], wrist) > dist(lm[pipIdx], wrist) * 1.15;
+}
+
+// ジェスチャー判定
+function detectGesture(lm) {
+  const indexExt = isFingerExtended(lm, 8, 6);
+  const middleExt = isFingerExtended(lm, 12, 10);
+  const ringExt = isFingerExtended(lm, 16, 14);
+  const pinkyExt = isFingerExtended(lm, 20, 18);
+
+  // 親指と人差し指の距離（ピンチ判定）
+  const pinchDist = dist(lm[4], lm[8]);
+
+  // ピンチ（掴む）: 親指と人差し指の先が近い
+  if (pinchDist < 0.055) {
+    return 'PINCH';
+  }
+
+  // 人差し指だけ立てている（描画）
+  if (indexExt && !middleExt && !ringExt && !pinkyExt) {
+    return 'POINT';
+  }
+
+  // パー（4本以上の指が伸びている）
+  if (indexExt && middleExt && ringExt && pinkyExt) {
+    return 'OPEN';
+  }
+
+  return 'OTHER';
+}
+
+// 生き物クラス（描いた線 または 自分の切り抜き画像）
+class Creature {
+  constructor(options) {
+    this.type = options.type; // 'drawing' or 'selfie'
+    this.x = options.x;
+    this.y = options.y;
+    this.vx = (Math.random() - 0.5) * 6;
+    this.vy = -Math.random() * 5 - 2;
+    this.radius = options.radius || 50;
+
+    // 描画タイプ用
+    this.strokes = options.strokes || [];
+
+    // 自分画像タイプ用
+    this.image = options.image || null;
+
+    // アニメーション用パラメータ
+    this.phase = Math.random() * Math.PI * 2;
+    this.squashX = 1;
+    this.squashY = 1;
+    this.isGrabbed = false;
+    this.nextActionTime = performance.now() + 500 + Math.random() * 1500;
+    this.eyeOffset = { x: 0, y: 0 };
+  }
+
+  update(now) {
+    if (this.isGrabbed) {
+      this.squashX = 1.15;
+      this.squashY = 0.85;
+      return;
+    }
+
+    // 重力
+    const gravity = 0.45;
+    this.vy += gravity;
+
+    this.x += this.vx;
+    this.y += this.vy;
+
+    // 地面との衝突（バウンド＆ランダム行動）
+    const floorY = height - this.radius - 10;
+    if (this.y >= floorY) {
+      this.y = floorY;
+      this.vy = 0;
+      this.vx *= 0.85; // 摩擦
+
+      // ランダムにジャンプしたり歩き回ったりする
+      if (now > this.nextActionTime) {
+        const action = Math.random();
+        if (action < 0.65) {
+          // ジャンプ！
+          this.vy = -(Math.random() * 11 + 8);
+          this.vx = (Math.random() - 0.5) * 12;
+          this.squashX = 0.75;
+          this.squashY = 1.3;
+        } else {
+          // 横にトコトコ移動
+          this.vx = (Math.random() - 0.5) * 10;
+          this.vy = -3;
+        }
+        this.eyeOffset.x = Math.sign(this.vx) * 4;
+        this.nextActionTime = now + 600 + Math.random() * 1800;
+      }
+    }
+
+    // 壁との反射
+    if (this.x < this.radius) {
+      this.x = this.radius;
+      this.vx = Math.abs(this.vx) * 0.8;
+    } else if (this.x > width - this.radius) {
+      this.x = width - this.radius;
+      this.vx = -Math.abs(this.vx) * 0.8;
+    }
+
+    // 天井との反射
+    if (this.y < this.radius) {
+      this.y = this.radius;
+      this.vy = Math.abs(this.vy) * 0.5;
+    }
+
+    // ぷにぷに伸縮の復元
+    this.phase += 0.15;
+    const idleWobble = Math.sin(this.phase) * 0.04;
+    this.squashX += (1 + idleWobble - this.squashX) * 0.15;
+    this.squashY += (1 - idleWobble - this.squashY) * 0.15;
+  }
+
+  draw(ctx) {
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.scale(this.squashX, this.squashY);
+
+    if (this.type === 'drawing') {
+      // 白い線を描画（少し光彩をつける）
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 8;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctx.shadowColor = 'rgba(120, 220, 255, 0.8)';
+      ctx.shadowBlur = 12;
+
+      for (const stroke of this.strokes) {
+        if (stroke.length < 2) continue;
+        ctx.beginPath();
+        ctx.moveTo(stroke[0].x, stroke[0].y);
+        for (let i = 1; i < stroke.length; i++) {
+          ctx.lineTo(stroke[i].x, stroke[i].y);
+        }
+        ctx.stroke();
+      }
+      ctx.shadowBlur = 0;
+
+      // 生き物らしさを出すかわいい目玉を描画
+      this.drawEyes(ctx, 0, -this.radius * 0.2);
+
+    } else if (this.type === 'selfie' && this.image) {
+      // 自分の姿を丸く切り抜いて生き物として描画
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
+      ctx.closePath();
+      ctx.clip();
+
+      ctx.drawImage(
+        this.image,
+        -this.radius,
+        -this.radius,
+        this.radius * 2,
+        this.radius * 2
+      );
+      ctx.restore();
+
+      // 枠線
+      ctx.strokeStyle = '#ffd166';
+      ctx.lineWidth = 5;
+      ctx.beginPath();
+      ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // 足（ぴょこぴょこ動く小さな足）
+      const footSwing = Math.sin(this.phase * 1.5) * 6;
+      ctx.fillStyle = '#ff6b6b';
+      ctx.beginPath();
+      ctx.ellipse(-22, this.radius - 2 + footSwing, 14, 9, 0, 0, Math.PI * 2);
+      ctx.ellipse(22, this.radius - 2 - footSwing, 14, 9, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    ctx.restore();
+  }
+
+  drawEyes(ctx, cx, cy) {
+    const eyeSpacing = 14;
+    // 白目
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(cx - eyeSpacing, cy, 8, 0, Math.PI * 2);
+    ctx.arc(cx + eyeSpacing, cy, 8, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = '#222';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // 黒目
+    ctx.fillStyle = '#111111';
+    ctx.beginPath();
+    ctx.arc(cx - eyeSpacing + this.eyeOffset.x, cy + this.eyeOffset.y, 4, 0, Math.PI * 2);
+    ctx.arc(cx + eyeSpacing + this.eyeOffset.x, cy + this.eyeOffset.y, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  contains(px, py) {
+    return Math.hypot(px - this.x, py - this.y) <= this.radius + 25;
+  }
+}
+
+// 描かれた線を生き物に変換する
+function convertDrawingToCreature() {
+  if (currentStroke && currentStroke.length > 0) {
+    allStrokes.push(currentStroke);
+    currentStroke = null;
+  }
+  if (allStrokes.length === 0) return;
+
+  // 全点のバウンディングボックスを計算
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  let pointCount = 0;
+
+  for (const stroke of allStrokes) {
+    for (const pt of stroke) {
+      if (pt.x < minX) minX = pt.x;
+      if (pt.y < minY) minY = pt.y;
+      if (pt.x > maxX) maxX = pt.x;
+      if (pt.y > maxY) maxY = pt.y;
+      pointCount++;
+    }
+  }
+
+  if (pointCount < 5) {
+    allStrokes = [];
+    return;
+  }
+
+  const centerX = (minX + maxX) / 2;
+  const centerY = (minY + maxY) / 2;
+  const radius = Math.max((maxX - minX) / 2, (maxY - minY) / 2, 35);
+
+  // 中心からの相対座標に変換
+  const relativeStrokes = allStrokes.map(stroke =>
+    stroke.map(pt => ({
+      x: pt.x - centerX,
+      y: pt.y - centerY
+    }))
+  );
+
+  creatures.push(new Creature({
+    type: 'drawing',
+    x: centerX,
+    y: centerY,
+    radius: radius,
+    strokes: relativeStrokes
+  }));
+
+  allStrokes = [];
+}
+
+// プラスボタン：現在の自分のカメラ映像を切り抜いて生き物にする
+addMeBtn.addEventListener('click', () => {
+  if (video.readyState < 2) return;
+
+  const snapCanvas = document.createElement('canvas');
+  const size = 240;
+  snapCanvas.width = size;
+  snapCanvas.height = size;
+  const sCtx = snapCanvas.getContext('2d');
+
+  // 左右反転して自分の姿をキャプチャ
+  sCtx.translate(size, 0);
+  sCtx.scale(-1, 1);
+
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const minSide = Math.min(vw, vh);
+  const sx = (vw - minSide) / 2;
+  const sy = (vh - minSide) / 2;
+
+  sCtx.drawImage(video, sx, sy, minSide, minSide, 0, 0, size, size);
+
+  const img = new Image();
+  img.src = snapCanvas.toDataURL('image/png');
+  img.onload = () => {
+    creatures.push(new Creature({
+      type: 'selfie',
+      x: width / 2 + (Math.random() - 0.5) * 100,
+      y: height / 3,
+      radius: 65,
+      image: img
+    }));
+  };
+});
+
+// MediaPipe Hands の結果処理
+function onResults(results) {
+  if (loadingEl.style.display !== 'none') {
+    loadingEl.style.display = 'none';
+  }
+
+  if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+    const lm = results.multiHandLandmarks[0];
+    const gesture = detectGesture(lm);
+
+    // 鏡像反転座標に変換
+    const indexTip = {
+      x: (1 - lm[8].x) * width,
+      y: lm[8].y * height
+    };
+    const thumbTip = {
+      x: (1 - lm[4].x) * width,
+      y: lm[4].y * height
+    };
+    const pinchCenter = {
+      x: (indexTip.x + thumbTip.x) / 2,
+      y: (indexTip.y + thumbTip.y) / 2
+    };
+
+    latestHandData = { lm, gesture, indexTip, thumbTip, pinchCenter };
+  } else {
+    latestHandData = null;
+  }
+}
+
+// メイン描画＆物理演算ループ
+function renderLoop() {
+  const now = performance.now();
+
+  // 1. カメラ映像を鏡像反転して背景に描画
+  ctx.save();
+  ctx.translate(width, 0);
+  ctx.scale(-1, 1);
+  if (video.readyState >= 2) {
+    // アスペクト比を維持して画面いっぱいに描画（cover）
+    const vRatio = video.videoWidth / video.videoHeight;
+    const cRatio = width / height;
+    let drawW, drawH, offsetX, offsetY;
+    if (cRatio > vRatio) {
+      drawW = width;
+      drawH = width / vRatio;
+      offsetX = 0;
+      offsetY = (height - drawH) / 2;
+    } else {
+      drawH = height;
+      drawW = height * vRatio;
+      offsetX = (width - drawW) / 2;
+      offsetY = 0;
+    }
+    ctx.drawImage(video, offsetX, offsetY, drawW, drawH);
+  }
+  ctx.restore();
+
+  // 2. 手のジェスチャーに応じた処理
+  if (latestHandData) {
+    const { gesture, indexTip, pinchCenter } = latestHandData;
+
+    if (gesture === 'POINT') {
+      statusEl.textContent = '☝️ お絵かき中...';
+      // 掴み解除
+      releaseGrab();
+
+      // 新しいストローク開始または継続
+      if (!currentStroke) {
+        currentStroke = [];
+      }
+      const lastPt = currentStroke[currentStroke.length - 1];
+      if (!lastPt || dist(lastPt, indexTip) > 4) {
+        currentStroke.push({ x: indexTip.x, y: indexTip.y });
+      }
+
+      // 指先の光るポインター
+      ctx.fillStyle = '#ffffff';
+      ctx.shadowColor = '#00f2fe';
+      ctx.shadowBlur = 15;
+      ctx.beginPath();
+      ctx.arc(indexTip.x, indexTip.y, 10, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+    } else {
+      // 人差し指を立てるのをやめたら現在の線を確定
+      if (currentStroke && currentStroke.length > 0) {
+        allStrokes.push(currentStroke);
+        currentStroke = null;
+      }
+
+      if (gesture === 'OPEN') {
+        statusEl.textContent = '✋ パー！生き物に変身！';
+        releaseGrab();
+        convertDrawingToCreature();
+
+      } else if (gesture === 'PINCH') {
+        statusEl.textContent = '🤏 掴み中！';
+        if (!grabbedCreature) {
+          // 後ろ（手前側）の生き物から優先して掴む判定
+          for (let i = creatures.length - 1; i >= 0; i--) {
+            if (creatures[i].contains(pinchCenter.x, pinchCenter.y)) {
+              grabbedCreature = creatures[i];
+              grabbedCreature.isGrabbed = true;
+              grabOffset.x = grabbedCreature.x - pinchCenter.x;
+              grabOffset.y = grabbedCreature.y - pinchCenter.y;
+              lastPinchPos = { ...pinchCenter };
+              break;
+            }
+          }
+        }
+
+        if (grabbedCreature) {
+          grabbedCreature.x = pinchCenter.x + grabOffset.x;
+          grabbedCreature.y = pinchCenter.y + grabOffset.y;
+          // 離したときに投げられるよう速度を記録
+          grabbedCreature.vx = (pinchCenter.x - lastPinchPos.x) * 0.8;
+          grabbedCreature.vy = (pinchCenter.y - lastPinchPos.y) * 0.8;
+          lastPinchPos = { ...pinchCenter };
+        }
+
+        // ピンチ位置にリング表示
+        ctx.strokeStyle = '#ffd166';
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.arc(pinchCenter.x, pinchCenter.y, 18, 0, Math.PI * 2);
+        ctx.stroke();
+
+      } else {
+        statusEl.textContent = '🖐️ 手を認識中';
+        releaseGrab();
+      }
+    }
+  } else {
+    statusEl.textContent = '手をかざしてください';
+    if (currentStroke && currentStroke.length > 0) {
+      allStrokes.push(currentStroke);
+      currentStroke = null;
+    }
+    releaseGrab();
+  }
+
+  // 3. まだ生き物になっていない白い描画線を描画
+  ctx.save();
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 8;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.shadowColor = 'rgba(255, 255, 255, 0.8)';
+  ctx.shadowBlur = 10;
+
+  const strokesToDraw = currentStroke ? [...allStrokes, currentStroke] : allStrokes;
+  for (const stroke of strokesToDraw) {
+    if (stroke.length < 2) continue;
+    ctx.beginPath();
+    ctx.moveTo(stroke[0].x, stroke[0].y);
+    for (let i = 1; i < stroke.length; i++) {
+      ctx.lineTo(stroke[i].x, stroke[i].y);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+
+  // 4. すべての生き物を更新＆描画
+  for (const creature of creatures) {
+    creature.update(now);
+    creature.draw(ctx);
+  }
+
+  requestAnimationFrame(renderLoop);
+}
+
+function releaseGrab() {
+  if (grabbedCreature) {
+    grabbedCreature.isGrabbed = false;
+    grabbedCreature = null;
+  }
+}
+
+// MediaPipe Hands セットアップ
+const hands = new Hands({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+});
+
+hands.setOptions({
+  maxNumHands: 1,
+  modelComplexity: 1,
+  minDetectionConfidence: 0.7,
+  minTrackingConfidence: 0.7
+});
+
+hands.onResults(onResults);
+
+// カメラ起動
+const camera = new Camera(video, {
+  onFrame: async () => {
+    await hands.send({ image: video });
+  },
+  width: 1280,
+  height: 720
+});
+
+camera.start();
+requestAnimationFrame(renderLoop);
+</script>
+</body>
+</html>
