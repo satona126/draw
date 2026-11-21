@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>お絵かきで生き物に変換</title>
+  <title>絵を生き物に変換</title>
   <!-- MediaPipe Hands & Camera Utils -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
@@ -62,6 +62,33 @@
     #add-me-btn:active {
       transform: scale(0.95);
     }
+    /* 右下のゴミ箱 */
+    #trash-bin {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      width: 80px;
+      height: 80px;
+      border-radius: 50%;
+      background: rgba(30, 30, 35, 0.75);
+      backdrop-filter: blur(6px);
+      color: white;
+      font-size: 36px;
+      border: 3px dashed rgba(255, 255, 255, 0.5);
+      box-shadow: 0 6px 20px rgba(0, 0, 0, 0.4);
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 0.2s ease, background 0.2s ease, border-color 0.2s ease;
+      pointer-events: none;
+    }
+    #trash-bin.active {
+      transform: scale(1.22);
+      background: rgba(230, 57, 70, 0.9);
+      border: 3px solid #ffffff;
+      box-shadow: 0 0 25px rgba(230, 57, 70, 0.8);
+    }
     /* ステータスガイド表示 */
     #hud {
       position: fixed;
@@ -109,12 +136,13 @@
   <canvas id="canvas"></canvas>
   <div id="hud">
     <div>状態: <strong id="gesture-status">手をかざしてください</strong></div>
-    <div>☝️ <b>人差し指だけ立てる</b>：白い線で絵を描く</div>
+    <div>☝️ <b>人差し指を立てて1秒静止</b>：白い線で絵を描く</div>
     <div>✋ <b>手をパーにする</b>：描いた絵が生き物になる</div>
-    <div>🤏 <b>親指と人差し指でつまむ</b>：生き物を掴んで動かす</div>
+    <div>🤏 <b>親指と人差し指でつまむ</b>：生き物を掴む（右下のゴミ箱で削除）</div>
     <div>➕ <b>右上の＋ボタン</b>：自分の姿を生き物にする</div>
   </div>
   <button id="add-me-btn" title="自分の画像を生き物にする">＋</button>
+  <div id="trash-bin" title="ここに生き物を運ぶと消えます">🗑️</div>
 </div>
 
 <script>
@@ -123,6 +151,7 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const statusEl = document.getElementById('gesture-status');
 const addMeBtn = document.getElementById('add-me-btn');
+const trashBin = document.getElementById('trash-bin');
 const loadingEl = document.getElementById('loading');
 
 let width = canvas.width = window.innerWidth;
@@ -136,6 +165,13 @@ window.addEventListener('resize', () => {
 // 描画中のストロークと全ストローク
 let allStrokes = [];
 let currentStroke = null;
+
+// 1秒静止して描画開始するためのタイマー・座標管理
+let isDrawingActive = false;
+let pointHoldStartTime = null;
+let pointAnchorPos = null;
+const HOLD_DURATION_MS = 1000; // 1秒
+const STILL_THRESHOLD_PX = 25; // 静止とみなす許容範囲(px)
 
 // 生まれた生き物のリスト
 let creatures = [];
@@ -193,8 +229,8 @@ class Creature {
     this.type = options.type; // 'drawing' or 'selfie'
     this.x = options.x;
     this.y = options.y;
-    this.vx = (Math.random() - 0.5) * 6;
-    this.vy = -Math.random() * 5 - 2;
+    this.vx = (Math.random() - 0.5) * 4;
+    this.vy = -2;
     this.radius = options.radius || 50;
 
     // 描画タイプ用
@@ -208,14 +244,13 @@ class Creature {
     this.squashX = 1;
     this.squashY = 1;
     this.isGrabbed = false;
-    this.nextActionTime = performance.now() + 500 + Math.random() * 1500;
-    this.eyeOffset = { x: 0, y: 0 };
+    this.nextActionTime = performance.now() + 1000 + Math.random() * 2000;
   }
 
   update(now) {
     if (this.isGrabbed) {
-      this.squashX = 1.15;
-      this.squashY = 0.85;
+      this.squashX = 1.12;
+      this.squashY = 0.88;
       return;
     }
 
@@ -231,24 +266,25 @@ class Creature {
     if (this.y >= floorY) {
       this.y = floorY;
       this.vy = 0;
-      this.vx *= 0.85; // 摩擦
+      this.vx *= 0.88; // 摩擦
 
-      // ランダムにジャンプしたり歩き回ったりする
+      // ランダム行動（ジャンプはたまにだけ、普段はトコトコ移動や休憩）
       if (now > this.nextActionTime) {
         const action = Math.random();
-        if (action < 0.65) {
-          // ジャンプ！
-          this.vy = -(Math.random() * 11 + 8);
-          this.vx = (Math.random() - 0.5) * 12;
-          this.squashX = 0.75;
-          this.squashY = 1.3;
+        if (action < 0.18) {
+          // たまにジャンプ！（約18%の確率）
+          this.vy = -(Math.random() * 9 + 7);
+          this.vx = (Math.random() - 0.5) * 9;
+          this.squashX = 0.78;
+          this.squashY = 1.25;
+        } else if (action < 0.75) {
+          // 横にトコトコ歩く
+          this.vx = (Math.random() - 0.5) * 7;
         } else {
-          // 横にトコトコ移動
-          this.vx = (Math.random() - 0.5) * 10;
-          this.vy = -3;
+          // その場でじっとする
+          this.vx = 0;
         }
-        this.eyeOffset.x = Math.sign(this.vx) * 4;
-        this.nextActionTime = now + 600 + Math.random() * 1800;
+        this.nextActionTime = now + 1200 + Math.random() * 2500;
       }
     }
 
@@ -268,8 +304,8 @@ class Creature {
     }
 
     // ぷにぷに伸縮の復元
-    this.phase += 0.15;
-    const idleWobble = Math.sin(this.phase) * 0.04;
+    this.phase += 0.12;
+    const idleWobble = Math.sin(this.phase) * 0.035;
     this.squashX += (1 + idleWobble - this.squashX) * 0.15;
     this.squashY += (1 - idleWobble - this.squashY) * 0.15;
   }
@@ -280,7 +316,7 @@ class Creature {
     ctx.scale(this.squashX, this.squashY);
 
     if (this.type === 'drawing') {
-      // 白い線を描画（少し光彩をつける）
+      // 白い線を描画（目玉は描かない）
       ctx.strokeStyle = '#ffffff';
       ctx.lineWidth = 8;
       ctx.lineCap = 'round';
@@ -298,9 +334,6 @@ class Creature {
         ctx.stroke();
       }
       ctx.shadowBlur = 0;
-
-      // 生き物らしさを出すかわいい目玉を描画
-      this.drawEyes(ctx, 0, -this.radius * 0.2);
 
     } else if (this.type === 'selfie' && this.image) {
       // 自分の姿を丸く切り抜いて生き物として描画
@@ -336,27 +369,6 @@ class Creature {
     }
 
     ctx.restore();
-  }
-
-  drawEyes(ctx, cx, cy) {
-    const eyeSpacing = 14;
-    // 白目
-    ctx.fillStyle = '#ffffff';
-    ctx.beginPath();
-    ctx.arc(cx - eyeSpacing, cy, 8, 0, Math.PI * 2);
-    ctx.arc(cx + eyeSpacing, cy, 8, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.strokeStyle = '#222';
-    ctx.lineWidth = 2;
-    ctx.stroke();
-
-    // 黒目
-    ctx.fillStyle = '#111111';
-    ctx.beginPath();
-    ctx.arc(cx - eyeSpacing + this.eyeOffset.x, cy + this.eyeOffset.y, 4, 0, Math.PI * 2);
-    ctx.arc(cx + eyeSpacing + this.eyeOffset.x, cy + this.eyeOffset.y, 4, 0, Math.PI * 2);
-    ctx.fill();
   }
 
   contains(px, py) {
@@ -449,6 +461,14 @@ addMeBtn.addEventListener('click', () => {
   };
 });
 
+// ゴミ箱との重なり判定
+function isOverTrashBin(x, y) {
+  const rect = trashBin.getBoundingClientRect();
+  const binCenterX = rect.left + rect.width / 2;
+  const binCenterY = rect.top + rect.height / 2;
+  return Math.hypot(x - binCenterX, y - binCenterY) < 65;
+}
+
 // MediaPipe Hands の結果処理
 function onResults(results) {
   if (loadingEl.style.display !== 'none') {
@@ -479,6 +499,17 @@ function onResults(results) {
   }
 }
 
+// 描画状態をリセットするヘルパー
+function stopPointing() {
+  if (currentStroke && currentStroke.length > 0) {
+    allStrokes.push(currentStroke);
+    currentStroke = null;
+  }
+  isDrawingActive = false;
+  pointHoldStartTime = null;
+  pointAnchorPos = null;
+}
+
 // メイン描画＆物理演算ループ
 function renderLoop() {
   const now = performance.now();
@@ -488,7 +519,6 @@ function renderLoop() {
   ctx.translate(width, 0);
   ctx.scale(-1, 1);
   if (video.readyState >= 2) {
-    // アスペクト比を維持して画面いっぱいに描画（cover）
     const vRatio = video.videoWidth / video.videoHeight;
     const cRatio = width / height;
     let drawW, drawH, offsetX, offsetY;
@@ -512,34 +542,64 @@ function renderLoop() {
     const { gesture, indexTip, pinchCenter } = latestHandData;
 
     if (gesture === 'POINT') {
-      statusEl.textContent = '☝️ お絵かき中...';
-      // 掴み解除
       releaseGrab();
 
-      // 新しいストローク開始または継続
-      if (!currentStroke) {
-        currentStroke = [];
-      }
-      const lastPt = currentStroke[currentStroke.length - 1];
-      if (!lastPt || dist(lastPt, indexTip) > 4) {
-        currentStroke.push({ x: indexTip.x, y: indexTip.y });
-      }
+      if (!isDrawingActive) {
+        // まだ描画開始前：1秒間指先が静止しているかチェック
+        if (!pointHoldStartTime || dist(indexTip, pointAnchorPos) > STILL_THRESHOLD_PX) {
+          // 動いたらタイマーと基準位置をリセット
+          pointHoldStartTime = now;
+          pointAnchorPos = { ...indexTip };
+        }
 
-      // 指先の光るポインター
-      ctx.fillStyle = '#ffffff';
-      ctx.shadowColor = '#00f2fe';
-      ctx.shadowBlur = 15;
-      ctx.beginPath();
-      ctx.arc(indexTip.x, indexTip.y, 10, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.shadowBlur = 0;
+        const elapsed = now - pointHoldStartTime;
+        const progress = Math.min(elapsed / HOLD_DURATION_MS, 1);
+        statusEl.textContent = `☝️ そのまま1秒静止で描画開始... (${Math.floor(progress * 100)}%)`;
+
+        // チャージ中のプログレスリング表示
+        ctx.save();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.arc(indexTip.x, indexTip.y, 22, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.strokeStyle = '#ffd166';
+        ctx.lineWidth = 5;
+        ctx.beginPath();
+        ctx.arc(indexTip.x, indexTip.y, 22, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * progress);
+        ctx.stroke();
+        ctx.restore();
+
+        if (elapsed >= HOLD_DURATION_MS) {
+          isDrawingActive = true;
+          currentStroke = [{ x: indexTip.x, y: indexTip.y }];
+        }
+      } else {
+        // 1秒静止を達成し描画モード中（指を立てている間はずっと描ける）
+        statusEl.textContent = '✏️ お絵かき中！';
+
+        if (!currentStroke) {
+          currentStroke = [];
+        }
+        const lastPt = currentStroke[currentStroke.length - 1];
+        if (!lastPt || dist(lastPt, indexTip) > 4) {
+          currentStroke.push({ x: indexTip.x, y: indexTip.y });
+        }
+
+        // 指先の光るポインター
+        ctx.fillStyle = '#ffffff';
+        ctx.shadowColor = '#00f2fe';
+        ctx.shadowBlur = 15;
+        ctx.beginPath();
+        ctx.arc(indexTip.x, indexTip.y, 10, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.shadowBlur = 0;
+      }
 
     } else {
-      // 人差し指を立てるのをやめたら現在の線を確定
-      if (currentStroke && currentStroke.length > 0) {
-        allStrokes.push(currentStroke);
-        currentStroke = null;
-      }
+      // 人差し指を立てるのをやめたらリセット
+      stopPointing();
 
       if (gesture === 'OPEN') {
         statusEl.textContent = '✋ パー！生き物に変身！';
@@ -547,9 +607,8 @@ function renderLoop() {
         convertDrawingToCreature();
 
       } else if (gesture === 'PINCH') {
-        statusEl.textContent = '🤏 掴み中！';
+        statusEl.textContent = '🤏 掴み中！（ゴミ箱で削除）';
         if (!grabbedCreature) {
-          // 後ろ（手前側）の生き物から優先して掴む判定
           for (let i = creatures.length - 1; i >= 0; i--) {
             if (creatures[i].contains(pinchCenter.x, pinchCenter.y)) {
               grabbedCreature = creatures[i];
@@ -565,10 +624,21 @@ function renderLoop() {
         if (grabbedCreature) {
           grabbedCreature.x = pinchCenter.x + grabOffset.x;
           grabbedCreature.y = pinchCenter.y + grabOffset.y;
-          // 離したときに投げられるよう速度を記録
           grabbedCreature.vx = (pinchCenter.x - lastPinchPos.x) * 0.8;
           grabbedCreature.vy = (pinchCenter.y - lastPinchPos.y) * 0.8;
           lastPinchPos = { ...pinchCenter };
+
+          // ゴミ箱の上に移動したら即座に削除
+          if (isOverTrashBin(grabbedCreature.x, grabbedCreature.y) || isOverTrashBin(pinchCenter.x, pinchCenter.y)) {
+            trashBin.classList.add('active');
+            creatures = creatures.filter(c => c !== grabbedCreature);
+            grabbedCreature = null;
+            setTimeout(() => trashBin.classList.remove('active'), 300);
+          } else {
+            trashBin.classList.remove('active');
+          }
+        } else {
+          trashBin.classList.remove('active');
         }
 
         // ピンチ位置にリング表示
@@ -585,10 +655,7 @@ function renderLoop() {
     }
   } else {
     statusEl.textContent = '手をかざしてください';
-    if (currentStroke && currentStroke.length > 0) {
-      allStrokes.push(currentStroke);
-      currentStroke = null;
-    }
+    stopPointing();
     releaseGrab();
   }
 
@@ -627,6 +694,7 @@ function releaseGrab() {
     grabbedCreature.isGrabbed = false;
     grabbedCreature = null;
   }
+  trashBin.classList.remove('active');
 }
 
 // MediaPipe Hands セットアップ
